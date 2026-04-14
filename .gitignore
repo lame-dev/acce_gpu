@@ -2,3 +2,9 @@
 *.log.*
 vitis_hls.log
 slurm-*out.log
+
+
+flood.o
+flood_seq
+flood_seq.o
+res_seq.out
