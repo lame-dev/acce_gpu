@@ -1,0 +1,4 @@
+*.log
+*.log.*
+vitis_hls.log
+slurm-*out.log
