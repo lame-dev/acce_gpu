@@ -261,7 +261,10 @@ __global__ void step2_spillage_kernel(int rows,
             spillage_level[idx] = my_spillage_level;
 
             float *spill_neigh[CONTIGUOUS_CELLS] = {
-                spill_neigh_0, spill_neigh_1, spill_neigh_2, spill_neigh_3
+                spill_neigh_0, 
+                spill_neigh_1, 
+                spill_neigh_2, 
+                spill_neigh_3,
             };
             for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
                 int new_row = row + displacements[cell_pos][0];
