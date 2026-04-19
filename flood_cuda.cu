@@ -48,12 +48,11 @@
 
 extern "C" double get_time();
 
-/* Coalesced memory access: spillage_from_neigh split into 4 per-direction
- arrays */
+/* spillage_level > 0 replaces the separate spillage_flag array, saving one
+   global read + write per cell per iteration */
 __global__ void step3_propagation_kernel(int rows,
                                          int columns,
                                          int *water_level,
-                                         float *spillage_flag,
                                          float *spillage_level,
                                          float *spill_neigh_0,
                                          float *spill_neigh_1,
@@ -65,10 +64,12 @@ __global__ void step3_propagation_kernel(int rows,
     if (idx >= total_cells)
         return;
 
-    if (spillage_flag[idx] == 1.0f) {
-        float current_spillage = spillage_level[idx] / SPILLAGE_FACTOR;
+    float sl = spillage_level[idx];
+    if (sl > 0.0f) {
+        float current_spillage = sl / SPILLAGE_FACTOR;
         water_level[idx] -= FIXED(current_spillage);
         atomicMax(max_spillage_bits, __float_as_int(current_spillage));
+        spillage_level[idx] = 0.0f;
     }
 
     /* SoA: consecutive threads now read consecutive addresses per array */
@@ -77,10 +78,7 @@ __global__ void step3_propagation_kernel(int rows,
     water_level[idx] += FIXED(spill_neigh_2[idx] / SPILLAGE_FACTOR);
     water_level[idx] += FIXED(spill_neigh_3[idx] / SPILLAGE_FACTOR);
 
-    /* Optimization Reset dir3ectly after read: eliminates separate reset kernel
-     * launch per iteration */
-    spillage_flag[idx] = 0.0f;
-    spillage_level[idx] = 0.0f;
+    /* Reset after read: eliminates separate reset kernel launch per iteration */
     spill_neigh_0[idx] = 0.0f;
     spill_neigh_1[idx] = 0.0f;
     spill_neigh_2[idx] = 0.0f;
@@ -135,7 +133,6 @@ __global__ void step2_spillage_kernel(int rows,
                                       int columns,
                                       const float *ground,
                                       const int *water_level,
-                                      float *spillage_flag,
                                       float *spillage_level,
                                       float *spill_neigh_0,
                                       float *spill_neigh_1,
@@ -257,7 +254,6 @@ __global__ void step2_spillage_kernel(int rows,
     if (sum_diff > 0.0f) {
         float proportion = my_spillage_level / sum_diff;
         if (proportion > 1e-8f) {
-            spillage_flag[idx] = 1.0f;
             spillage_level[idx] = my_spillage_level;
 
             float *spill_neigh[CONTIGUOUS_CELLS] = {
@@ -319,7 +315,6 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     float *d_ground = NULL;
     int *d_water_level = NULL;
-    float *d_spillage_flag = NULL;
     float *d_spillage_level = NULL;
     float *d_spill_neigh[CONTIGUOUS_CELLS] = {NULL, NULL, NULL, NULL};
     unsigned long long *d_total_water_loss = NULL;
@@ -339,7 +334,6 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     CUDA_CHECK_FUNCTION(cudaMalloc((void **)&d_ground, cells_size_float));
     CUDA_CHECK_FUNCTION(cudaMalloc((void **)&d_water_level, cells_size_int));
-    CUDA_CHECK_FUNCTION(cudaMalloc((void **)&d_spillage_flag, cells_size_float));
     CUDA_CHECK_FUNCTION(cudaMalloc((void **)&d_spillage_level, cells_size_float));
     for (int i = 0; i < CONTIGUOUS_CELLS; i++)
         CUDA_CHECK_FUNCTION(cudaMalloc((void **)&d_spill_neigh[i], cells_size_float));
@@ -381,6 +375,8 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     int total_cells = rows * columns;
     int block_size = 256;
     int grid_size = (total_cells + block_size - 1) / block_size;
+    dim3 block2d(TILE_W, TILE_H);
+    dim3 grid2d((columns + TILE_W - 1) / TILE_W, (rows + TILE_H - 1) / TILE_H);
 
     /* Flood simulation */
     for (*minute = 0; *minute < p->num_minutes && max_spillage_iter > p->threshold; (*minute)++) {
@@ -430,9 +426,7 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 #endif
 
         /* Step 2: Compute water spillage to neighbor cells (2D blocks with shared memory tiling) */
-        dim3 block2d(TILE_W, TILE_H);
-        dim3 grid2d((columns + TILE_W - 1) / TILE_W, (rows + TILE_H - 1) / TILE_H);
-        step2_spillage_kernel<<<grid2d, block2d>>>(rows, columns, d_ground, d_water_level, d_spillage_flag,
+        step2_spillage_kernel<<<grid2d, block2d>>>(rows, columns, d_ground, d_water_level,
                                                    d_spillage_level,
                                                    d_spill_neigh[0], d_spill_neigh[1],
                                                    d_spill_neigh[2], d_spill_neigh[3],
@@ -445,7 +439,7 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
         /* Optimization Async memset: avoids host-device sync before 
          *propagation kernel */
         CUDA_CHECK_FUNCTION(cudaMemsetAsync(d_max_spillage_bits, 0, sizeof(int), 0));
-        step3_propagation_kernel<<<grid_size, block_size>>>(rows, columns, d_water_level, d_spillage_flag,
+        step3_propagation_kernel<<<grid_size, block_size>>>(rows, columns, d_water_level,
                                     d_spillage_level,
                                     d_spill_neigh[0], d_spill_neigh[1],
                                     d_spill_neigh[2], d_spill_neigh[3],
@@ -508,7 +502,6 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     CUDA_CHECK_FUNCTION(cudaFree(d_ground));
     CUDA_CHECK_FUNCTION(cudaFree(d_water_level));
-    CUDA_CHECK_FUNCTION(cudaFree(d_spillage_flag));
     CUDA_CHECK_FUNCTION(cudaFree(d_spillage_level));
     for (int i = 0; i < CONTIGUOUS_CELLS; i++)
         CUDA_CHECK_FUNCTION(cudaFree(d_spill_neigh[i]));
