@@ -51,9 +51,9 @@ extern "C" double get_time();
 __global__ void step3_propagation_kernel(int rows,
                                          int columns,
                                          int *water_level,
-                                         float *spillage_flag,
-                                         float *spillage_level,
-                                         float *spillage_from_neigh,
+                                         const float *spillage_flag,
+                                         const float *spillage_level,
+                                         const float *spillage_from_neigh,
                                          int *max_spillage_bits) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_cells = rows * columns;
@@ -70,14 +70,26 @@ __global__ void step3_propagation_kernel(int rows,
     for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
         water_level[idx] += FIXED(spillage_from_neigh[base + cell_pos] / SPILLAGE_FACTOR);
     }
-
-    /* Opt 1: Reset after read — eliminates separate reset kernel launch per iteration */
-    spillage_flag[idx] = 0.0f;
-    spillage_level[idx] = 0.0f;
-    for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++)
-        spillage_from_neigh[base + cell_pos] = 0.0f;
 }
 
+__global__ void reset_spillage_kernel(int rows,
+                                      int columns,
+                                      float *spillage_flag,
+                                      float *spillage_level,
+                                      float *spillage_from_neigh) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_cells = rows * columns;
+    if (idx >= total_cells)
+        return;
+
+    spillage_flag[idx] = 0.0f;
+    spillage_level[idx] = 0.0f;
+
+    int base = idx * CONTIGUOUS_CELLS;
+    for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
+        spillage_from_neigh[base + cell_pos] = 0.0f;
+    }
+}
 
 __global__ void rainfall_kernel(int rows,
                                 int columns,
@@ -319,6 +331,10 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 #endif
 
         /* Step 2: Compute water spillage to neighbor cells */
+        reset_spillage_kernel<<<grid_size, block_size>>>(rows, columns, d_spillage_flag, d_spillage_level,
+                                                         d_spillage_from_neigh);
+        CUDA_CHECK_KERNEL();
+
         step2_spillage_kernel<<<grid_size, block_size>>>(rows, columns, d_ground, d_water_level, d_spillage_flag,
                                                          d_spillage_level, d_spillage_from_neigh,
                                                          d_total_water_loss);
