@@ -343,6 +343,7 @@ int main(int argc, char *argv[]) {
     do_compute(&p, &r);
 
     /* Free resources */
+    free(ground);
     free(clouds);
 
 #ifndef ANIMATION
