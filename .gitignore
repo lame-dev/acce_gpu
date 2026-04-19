@@ -11,3 +11,5 @@ res_seq.out
 *.o
 flood_cuda
 *.out
+
+results/
