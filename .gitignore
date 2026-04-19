@@ -8,3 +8,5 @@ flood.o
 flood_seq
 flood_seq.o
 res_seq.out
+*.o
+flood_cuda
