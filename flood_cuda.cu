@@ -110,10 +110,10 @@ __global__ void rainfall_kernel(int rows,
     float y_pos = COORD_MAT2SCEN_Y(row_pos);
     float dx = x_pos - cloud.x;
     float dy = y_pos - cloud.y;
-    float distance = sqrtf(dx * dx + dy * dy);
+    float distance = __fsqrt_rn(dx * dx + dy * dy);
 
     if (distance < cloud.radius) {
-        float rain = ex_factor * MAX(0.0f, cloud.intensity - distance / cloud.radius * sqrtf(cloud.intensity));
+        float rain = ex_factor * MAX(0.0f, cloud.intensity - distance / cloud.radius * __fsqrt_rn(cloud.intensity));
         float meters_per_minute = rain / 1000.0f / 60.0f;
         int rain_fixed = FIXED(meters_per_minute);
         atomicAdd(&water_level[row * columns + col], rain_fixed);
@@ -283,8 +283,6 @@ __global__ void step2_spillage_kernel(int rows,
     }
 }
 
-
-
 /*
  * Main compute function
  */
@@ -292,20 +290,10 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     int rows = p->rows, columns = p->columns;
     int *minute = &r->minute;
 
-    /* 2. Start global timer */
     CUDA_CHECK_FUNCTION(cudaSetDevice(0));
 
-    /*
-     *
-     * Allocate memory and call kernels in this function.
-     * Ensure all debug and animation code works in your final version.
-     *
-     */
-
-    /* Memory allocation */
-
-    int *water_level;           // Level of water on each cell (fixed precision)
-    float *ground;              // Ground height
+    int *water_level;
+    float *ground;
 
     float *d_ground = NULL;
     int *d_water_level = NULL;
@@ -341,9 +329,6 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     CUDA_CHECK_FUNCTION(cudaMemset(d_total_rain, 0, sizeof(unsigned long long)));
 
     CUDA_CHECK_FUNCTION(cudaMemset(d_max_spillage_bits, 0, sizeof(int)));
-
-    /* Ground generation and initialization of other structures */
-    int row_pos, col_pos;
 
 #ifdef DEBUG
     print_matrix(PRECISION_FLOAT, rows, columns, ground, "Ground heights");
@@ -395,13 +380,11 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
             float col_start = COORD_SCEN2MAT_X(MAX(0, c_cloud.x - c_cloud.radius));
             float col_end = COORD_SCEN2MAT_X(MIN(c_cloud.x + c_cloud.radius, SCENARIO_SIZE));
 
-            int row_start_idx = MAX(0, (int)row_start);
-            int col_start_idx = MAX(0, (int)col_start);
             int row_count = (int)ceilf(row_end - row_start);
             int col_count = (int)ceilf(col_end - col_start);
 
-            row_count = MIN(rows - row_start_idx, row_count);
-            col_count = MIN(columns - col_start_idx, col_count);
+            row_count = MIN(rows - MAX(0, (int)row_start), row_count);
+            col_count = MIN(columns - MAX(0, (int)col_start), col_count);
 
             if (row_count <= 0 || col_count <= 0)
                 continue;
@@ -473,8 +456,8 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     /* Statistics: Total remaining water and maximum amount of water in a cell */
     r->max_water_scenario = 0.0;
-    for (row_pos = 0; row_pos < rows; row_pos++) {
-        for (col_pos = 0; col_pos < columns; col_pos++) {
+    for (int row_pos = 0; row_pos < rows; row_pos++) {
+        for (int col_pos = 0; col_pos < columns; col_pos++) {
             if (FLOATING(accessMat(water_level, row_pos, col_pos)) > r->max_water_scenario)
                 r->max_water_scenario = FLOATING(accessMat(water_level, row_pos, col_pos));
             r->total_water += accessMat(water_level, row_pos, col_pos);
