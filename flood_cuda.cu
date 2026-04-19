@@ -227,23 +227,26 @@ __global__ void step2_spillage_kernel(int rows,
     float my_spillage_level = 0.0f;
     float current_height = s_ground[sy][sx] + FLOATING(s_water[sy][sx]);
 
-    /* Neighbor offsets in shared memory still match original displacements:
-       top={-1,0}, bottom={1,0}, left={0,-1}, right={0,1} */
+    /* Cache neighbor heights and boundary flags so the second loop can reuse them */
+    float neigh_h[CONTIGUOUS_CELLS];
+    /* True if neighbor is outside grid (boundary spillage becomes water loss) */
+    int neigh_is_boundary[CONTIGUOUS_CELLS];
+
     for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
         int new_row = row + displacements[cell_pos][0];
         int new_col = col + displacements[cell_pos][1];
-        int ny = sy + displacements[cell_pos][0];
-        int nx = sx + displacements[cell_pos][1];
+        neigh_is_boundary[cell_pos] = (new_row < 0 || new_row >= rows || new_col < 0 || new_col >= columns);
 
-        float neighbor_height;
-        if (new_row < 0 || new_row >= rows || new_col < 0 || new_col >= columns) {
-            neighbor_height = s_ground[sy][sx];
+        if (neigh_is_boundary[cell_pos]) {
+            neigh_h[cell_pos] = s_ground[sy][sx];
         } else {
-            neighbor_height = s_ground[ny][nx] + FLOATING(s_water[ny][nx]);
+            int ny = sy + displacements[cell_pos][0];
+            int nx = sx + displacements[cell_pos][1];
+            neigh_h[cell_pos] = s_ground[ny][nx] + FLOATING(s_water[ny][nx]);
         }
 
-        if (current_height >= neighbor_height) {
-            float height_diff = current_height - neighbor_height;
+        if (current_height >= neigh_h[cell_pos]) {
+            float height_diff = current_height - neigh_h[cell_pos];
             sum_diff += height_diff;
             my_spillage_level = MAX(my_spillage_level, height_diff);
         }
@@ -257,31 +260,22 @@ __global__ void step2_spillage_kernel(int rows,
             spillage_level[idx] = my_spillage_level;
 
             float *spill_neigh[CONTIGUOUS_CELLS] = {
-                spill_neigh_0, 
-                spill_neigh_1, 
-                spill_neigh_2, 
-                spill_neigh_3,
+                spill_neigh_0, spill_neigh_1, spill_neigh_2, spill_neigh_3
             };
             for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
-                int new_row = row + displacements[cell_pos][0];
-                int new_col = col + displacements[cell_pos][1];
-                int ny = sy + displacements[cell_pos][0];
-                int nx = sx + displacements[cell_pos][1];
-
-                float neighbor_height;
-                if (new_row < 0 || new_row >= rows || new_col < 0 || new_col >= columns) {
-                    neighbor_height = s_ground[sy][sx];
-                    if (current_height >= neighbor_height) {
+                if (neigh_is_boundary[cell_pos]) {
+                    if (current_height >= neigh_h[cell_pos]) {
                         unsigned long long loss =
-                            (unsigned long long)FIXED(proportion * (current_height - neighbor_height) / 2.0f);
+                            (unsigned long long)FIXED(proportion * (current_height - neigh_h[cell_pos]) / 2.0f);
                         atomicAdd(total_water_loss, loss);
                     }
                 } else {
-                    int neigh_idx = new_row * columns + new_col;
-                    neighbor_height = s_ground[ny][nx] + FLOATING(s_water[ny][nx]);
-                    if (current_height >= neighbor_height) {
+                    if (current_height >= neigh_h[cell_pos]) {
+                        int new_row = row + displacements[cell_pos][0];
+                        int new_col = col + displacements[cell_pos][1];
+                        int neigh_idx = new_row * columns + new_col;
                         spill_neigh[cell_pos][neigh_idx] =
-                            proportion * (current_height - neighbor_height);
+                            proportion * (current_height - neigh_h[cell_pos]);
                     }
                 }
             }
