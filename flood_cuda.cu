@@ -71,7 +71,7 @@ __global__ void step3_propagation_kernel(int rows,
         water_level[idx] += FIXED(spillage_from_neigh[base + cell_pos] / SPILLAGE_FACTOR);
     }
 
-    /* Opt 1: Reset after read — eliminates separate reset kernel launch per iteration */
+    /* Opt 1: Reset after read, eliminates separate reset kernel launch per iteration */
     spillage_flag[idx] = 0.0f;
     spillage_level[idx] = 0.0f;
     for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++)
@@ -262,7 +262,7 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     double max_spillage_iter = DBL_MAX;
 
-    /* Opt 3: Precompute trig — cos/sin are constant per cloud, avoid recomputing each iteration */
+    /* Opt 3: Precompute trig, cos/sin are constant per cloud, avoid recomputing each iteration */
     float *cloud_dx = (float *)malloc(sizeof(float) * p->num_clouds);
     float *cloud_dy = (float *)malloc(sizeof(float) * p->num_clouds);
     for (int c = 0; c < p->num_clouds; c++) {
@@ -273,13 +273,15 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     /* Prepare to measure runtime */
     r->runtime = get_time();
 
+    /* Opt 4: Hoist invariants, these values are constant across all iterations (compiler likely already does this) */
+    int total_cells = rows * columns;
+    int block_size = 256;
+    int grid_size = (total_cells + block_size - 1) / block_size;
+
     /* Flood simulation */
     for (*minute = 0; *minute < p->num_minutes && max_spillage_iter > p->threshold; (*minute)++) {
-        int total_cells = rows * columns;
-        int block_size = 256;
-        int grid_size = (total_cells + block_size - 1) / block_size;
 
-        /* Step 1.1: Clouds movement — replaces per-iteration cos/sin with simple addition */
+        /* Step 1.1: Clouds movement, replaces per-iteration cos/sin with simple addition */
         for (int cloud = 0; cloud < p->num_clouds; cloud++) {
             p->clouds[cloud].x += cloud_dx[cloud];
             p->clouds[cloud].y += cloud_dy[cloud];
@@ -332,7 +334,7 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
         /* Step 3: Propagation of previuosly computer water spillage to/from neighbors */
         max_spillage_iter = 0.0;
 
-        /* Opt 2: Async memset — avoids host-device sync before propagation kernel */
+        /* Opt 2: Async memset, avoids host-device sync before propagation kernel */
         CUDA_CHECK_FUNCTION(cudaMemsetAsync(d_max_spillage_bits, 0, sizeof(int), 0));
         step3_propagation_kernel<<<grid_size, block_size>>>(rows, columns, d_water_level, d_spillage_flag,
                                     d_spillage_level, d_spillage_from_neigh,
