@@ -292,6 +292,17 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     CUDA_CHECK_FUNCTION(cudaSetDevice(0));
 
+#ifdef PROFILE
+    cudaEvent_t prof_start, prof_stop;
+    CUDA_CHECK_FUNCTION(cudaEventCreate(&prof_start));
+    CUDA_CHECK_FUNCTION(cudaEventCreate(&prof_stop));
+    double prof_alloc_init = 0.0, prof_rainfall = 0.0;
+    double prof_spillage = 0.0, prof_propagation = 0.0, prof_readback = 0.0;
+    float prof_ms = 0.0f;
+
+    CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
+
     int *water_level;
     float *ground;
 
@@ -329,6 +340,13 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     CUDA_CHECK_FUNCTION(cudaMemset(d_total_rain, 0, sizeof(unsigned long long)));
 
     CUDA_CHECK_FUNCTION(cudaMemset(d_max_spillage_bits, 0, sizeof(int)));
+
+#ifdef PROFILE
+    CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+    CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+    CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+    prof_alloc_init += prof_ms;
+#endif
 
 #ifdef DEBUG
     print_matrix(PRECISION_FLOAT, rows, columns, ground, "Ground heights");
@@ -372,6 +390,9 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 #endif
 #endif
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
         /* Step 1.2: Rainfall */
         for (int cloud = 0; cloud < p->num_clouds; cloud++) {
             Cloud_t c_cloud = p->clouds[cloud];
@@ -397,11 +418,21 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
             CUDA_CHECK_KERNEL();
         }
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+        CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+        CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+        prof_rainfall += prof_ms;
+#endif
+
 #ifdef DEBUG
         CUDA_CHECK_FUNCTION(cudaMemcpy(water_level, d_water_level, cells_size_int, cudaMemcpyDeviceToHost));
         print_matrix(PRECISION_FIXED, rows, columns, water_level, "Water after rain");
 #endif
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
         /* Step 2: Compute water spillage to neighbor cells (2D blocks with shared memory tiling) */
         step2_spillage_kernel<<<grid2d, block2d>>>(rows, columns, d_ground, d_water_level,
                                                    d_spillage_level,
@@ -410,9 +441,19 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
                                                    d_total_water_loss);
         CUDA_CHECK_KERNEL();
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+        CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+        CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+        prof_spillage += prof_ms;
+#endif
+
         /* Step 3: Propagation of previuosly computer water spillage to/from neighbors */
         max_spillage_iter = 0.0;
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
         /* Optimization Async memset: avoids host-device sync before 
          *propagation kernel */
         CUDA_CHECK_FUNCTION(cudaMemsetAsync(d_max_spillage_bits, 0, sizeof(int), 0));
@@ -422,6 +463,15 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
                                     d_spill_neigh[2], d_spill_neigh[3],
                                     d_max_spillage_bits);
         CUDA_CHECK_KERNEL();
+
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+        CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+        CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+        prof_propagation += prof_ms;
+
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
 
         int max_spillage_bits = 0;
         CUDA_CHECK_FUNCTION(cudaMemcpy(&max_spillage_bits, d_max_spillage_bits, sizeof(int), cudaMemcpyDeviceToHost));
@@ -436,6 +486,13 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
             r->max_spillage_minute = *minute;
         }
 
+#ifdef PROFILE
+        CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+        CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+        CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+        prof_readback += prof_ms;
+#endif
+
 #ifdef DEBUG
 #ifndef ANIMATION
         CUDA_CHECK_FUNCTION(cudaMemcpy(water_level, d_water_level, cells_size_int, cudaMemcpyDeviceToHost));
@@ -446,6 +503,10 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     }
 
     r->runtime = get_time() - r->runtime;
+
+#ifdef PROFILE
+    CUDA_CHECK_FUNCTION(cudaEventRecord(prof_start, 0));
+#endif
 
     if (p->final_matrix) {
         CUDA_CHECK_FUNCTION(cudaMemcpy(water_level, d_water_level, cells_size_int, cudaMemcpyDeviceToHost));
@@ -476,6 +537,21 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
     unsigned long long total_rain_host = 0;
     CUDA_CHECK_FUNCTION(cudaMemcpy(&total_rain_host, d_total_rain, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     r->total_rain = (long)total_rain_host;
+
+#ifdef PROFILE
+    CUDA_CHECK_FUNCTION(cudaEventRecord(prof_stop, 0));
+    CUDA_CHECK_FUNCTION(cudaEventSynchronize(prof_stop));
+    CUDA_CHECK_FUNCTION(cudaEventElapsedTime(&prof_ms, prof_start, prof_stop));
+    prof_readback += prof_ms;
+
+    fprintf(stderr, "PROFILE: alloc_init=%.4f rainfall=%.4f spillage=%.4f propagation=%.4f readback=%.4f\n",
+            prof_alloc_init / 1000.0, prof_rainfall / 1000.0,
+            prof_spillage / 1000.0, prof_propagation / 1000.0,
+            prof_readback / 1000.0);
+
+    CUDA_CHECK_FUNCTION(cudaEventDestroy(prof_start));
+    CUDA_CHECK_FUNCTION(cudaEventDestroy(prof_stop));
+#endif
 
     CUDA_CHECK_FUNCTION(cudaFree(d_ground));
     CUDA_CHECK_FUNCTION(cudaFree(d_water_level));

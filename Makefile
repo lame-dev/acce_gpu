@@ -65,6 +65,9 @@ animation:
 animation_cuda:
 	make CUFLAGS="$(CUFLAGS) -DDEBUG -DANIMATION -g" FLAGS="$(FLAGS) -DDEBUG -DANIMATION -g" flood_cuda
 
+profile:
+	make CUFLAGS="$(CUFLAGS) -DPROFILE" flood_cuda
+
 test_seq: flood_seq
 	./flood_seq $(cat test_files/debug.in)
 
