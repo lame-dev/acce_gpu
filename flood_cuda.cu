@@ -123,8 +123,14 @@ __global__ void rainfall_kernel(int rows,
     }
 }
 
-/* Opt. Coalesced memory access: spill_neigh arrays indexed by [neigh_idx] 
-   *instead of [neigh_idx * 4 + cell_pos] */
+/* Shared memory tiling: load ground + water_level into 18x18 tile (16x16 + 1-cell border)
+   so neighbor lookups read from fast on-chip SRAM instead of global memory.
+   Border cells are the 1-cell-wide border loaded so edge threads can read their neighbors. */
+#define TILE_W 16
+#define TILE_H 16
+#define STILE_W (TILE_W + 2)
+#define STILE_H (TILE_H + 2)
+
 __global__ void step2_spillage_kernel(int rows,
                                       int columns,
                                       const float *ground,
@@ -136,31 +142,107 @@ __global__ void step2_spillage_kernel(int rows,
                                       float *spill_neigh_2,
                                       float *spill_neigh_3,
                                       unsigned long long *total_water_loss) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_cells = rows * columns;
-    if (idx >= total_cells)
-        return;
+    __shared__ float s_ground[STILE_H][STILE_W];
+    __shared__ int   s_water[STILE_H][STILE_W];
 
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int col = blockIdx.x * TILE_W + tx;
+    int row = blockIdx.y * TILE_H + ty;
+    int idx = row * columns + col;
+    int valid = (row < rows && col < columns);
+
+    /* Inner cell: each thread loads its own cell at (ty+1, tx+1) */
+    int sx = tx + 1;
+    int sy = ty + 1;
+    if (valid) {
+        s_ground[sy][sx] = ground[idx];
+        s_water[sy][sx]  = water_level[idx];
+    } else {
+        s_ground[sy][sx] = 0.0f;
+        s_water[sy][sx]  = 0;
+    }
+
+    /* Border cells: top row */
+    if (ty == 0) {
+        int hrow = row - 1;
+        int hcol = col;
+        if (hrow >= 0 && hcol < columns) {
+            int hidx = hrow * columns + hcol;
+            s_ground[0][sx] = ground[hidx];
+            s_water[0][sx]  = water_level[hidx];
+        } else {
+            s_ground[0][sx] = valid ? ground[idx] : 0.0f;
+            s_water[0][sx]  = 0;
+        }
+    }
+    /* Border cells: bottom row */
+    if (ty == TILE_H - 1) {
+        int hrow = row + 1;
+        int hcol = col;
+        if (hrow < rows && hcol < columns) {
+            int hidx = hrow * columns + hcol;
+            s_ground[STILE_H - 1][sx] = ground[hidx];
+            s_water[STILE_H - 1][sx]  = water_level[hidx];
+        } else {
+            s_ground[STILE_H - 1][sx] = valid ? ground[idx] : 0.0f;
+            s_water[STILE_H - 1][sx]  = 0;
+        }
+    }
+    /* Border cells: left column */
+    if (tx == 0) {
+        int hrow = row;
+        int hcol = col - 1;
+        if (hcol >= 0 && hrow < rows) {
+            int hidx = hrow * columns + hcol;
+            s_ground[sy][0] = ground[hidx];
+            s_water[sy][0]  = water_level[hidx];
+        } else {
+            s_ground[sy][0] = valid ? ground[idx] : 0.0f;
+            s_water[sy][0]  = 0;
+        }
+    }
+    /* Border cells: right column */
+    if (tx == TILE_W - 1) {
+        int hrow = row;
+        int hcol = col + 1;
+        if (hcol < columns && hrow < rows) {
+            int hidx = hrow * columns + hcol;
+            s_ground[sy][STILE_W - 1] = ground[hidx];
+            s_water[sy][STILE_W - 1]  = water_level[hidx];
+        } else {
+            s_ground[sy][STILE_W - 1] = valid ? ground[idx] : 0.0f;
+            s_water[sy][STILE_W - 1]  = 0;
+        }
+    }
+
+    /* All threads must finish loading shared memory before any thread reads it.
+       Must be before the early-return checks to avoid deadlock. */
+    __syncthreads();
+
+    /* Threads past grid edges (when grid size isn't divisible by tile size) */
+    if (!valid)
+        return;
     if (water_level[idx] <= 0)
         return;
 
-    int row = idx / columns;
-    int col = idx % columns;
-
     float sum_diff = 0.0f;
     float my_spillage_level = 0.0f;
-    float current_height = ground[idx] + FLOATING(water_level[idx]);
+    float current_height = s_ground[sy][sx] + FLOATING(s_water[sy][sx]);
 
+    /* Neighbor offsets in shared memory still match original displacements:
+       top={-1,0}, bottom={1,0}, left={0,-1}, right={0,1} */
     for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
         int new_row = row + displacements[cell_pos][0];
         int new_col = col + displacements[cell_pos][1];
+        int ny = sy + displacements[cell_pos][0];
+        int nx = sx + displacements[cell_pos][1];
 
         float neighbor_height;
         if (new_row < 0 || new_row >= rows || new_col < 0 || new_col >= columns) {
-            neighbor_height = ground[idx];
+            neighbor_height = s_ground[sy][sx];
         } else {
-            int neigh_idx = new_row * columns + new_col;
-            neighbor_height = ground[neigh_idx] + FLOATING(water_level[neigh_idx]);
+            neighbor_height = s_ground[ny][nx] + FLOATING(s_water[ny][nx]);
         }
 
         if (current_height >= neighbor_height) {
@@ -170,7 +252,7 @@ __global__ void step2_spillage_kernel(int rows,
         }
     }
 
-    my_spillage_level = MIN(FLOATING(water_level[idx]), my_spillage_level);
+    my_spillage_level = MIN(FLOATING(s_water[sy][sx]), my_spillage_level);
 
     if (sum_diff > 0.0f) {
         float proportion = my_spillage_level / sum_diff;
@@ -179,18 +261,17 @@ __global__ void step2_spillage_kernel(int rows,
             spillage_level[idx] = my_spillage_level;
 
             float *spill_neigh[CONTIGUOUS_CELLS] = {
-                spill_neigh_0, 
-                spill_neigh_1, 
-                spill_neigh_2, 
-                spill_neigh_3,
+                spill_neigh_0, spill_neigh_1, spill_neigh_2, spill_neigh_3
             };
             for (int cell_pos = 0; cell_pos < CONTIGUOUS_CELLS; cell_pos++) {
                 int new_row = row + displacements[cell_pos][0];
                 int new_col = col + displacements[cell_pos][1];
+                int ny = sy + displacements[cell_pos][0];
+                int nx = sx + displacements[cell_pos][1];
 
                 float neighbor_height;
                 if (new_row < 0 || new_row >= rows || new_col < 0 || new_col >= columns) {
-                    neighbor_height = ground[idx];
+                    neighbor_height = s_ground[sy][sx];
                     if (current_height >= neighbor_height) {
                         unsigned long long loss =
                             (unsigned long long)FIXED(proportion * (current_height - neighbor_height) / 2.0f);
@@ -198,9 +279,9 @@ __global__ void step2_spillage_kernel(int rows,
                     }
                 } else {
                     int neigh_idx = new_row * columns + new_col;
-                    neighbor_height = ground[neigh_idx] + FLOATING(water_level[neigh_idx]);
+                    neighbor_height = s_ground[ny][nx] + FLOATING(s_water[ny][nx]);
                     if (current_height >= neighbor_height) {
-                        spill_neigh[cell_pos][neigh_idx] = 
+                        spill_neigh[cell_pos][neigh_idx] =
                             proportion * (current_height - neighbor_height);
                     }
                 }
@@ -345,12 +426,14 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
         print_matrix(PRECISION_FIXED, rows, columns, water_level, "Water after rain");
 #endif
 
-        /* Step 2: Compute water spillage to neighbor cells */
-        step2_spillage_kernel<<<grid_size, block_size>>>(rows, columns, d_ground, d_water_level, d_spillage_flag,
-                                                         d_spillage_level,
-                                                         d_spill_neigh[0], d_spill_neigh[1],
-                                                         d_spill_neigh[2], d_spill_neigh[3],
-                                                         d_total_water_loss);
+        /* Step 2: Compute water spillage to neighbor cells (2D blocks with shared memory tiling) */
+        dim3 block2d(TILE_W, TILE_H);
+        dim3 grid2d((columns + TILE_W - 1) / TILE_W, (rows + TILE_H - 1) / TILE_H);
+        step2_spillage_kernel<<<grid2d, block2d>>>(rows, columns, d_ground, d_water_level, d_spillage_flag,
+                                                   d_spillage_level,
+                                                   d_spill_neigh[0], d_spill_neigh[1],
+                                                   d_spill_neigh[2], d_spill_neigh[3],
+                                                   d_total_water_loss);
         CUDA_CHECK_KERNEL();
 
         /* Step 3: Propagation of previuosly computer water spillage to/from neighbors */
