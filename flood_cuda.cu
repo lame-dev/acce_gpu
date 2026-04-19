@@ -262,6 +262,14 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     double max_spillage_iter = DBL_MAX;
 
+    /* Opt 3: Precompute trig — cos/sin are constant per cloud, avoid recomputing each iteration */
+    float *cloud_dx = (float *)malloc(sizeof(float) * p->num_clouds);
+    float *cloud_dy = (float *)malloc(sizeof(float) * p->num_clouds);
+    for (int c = 0; c < p->num_clouds; c++) {
+        cloud_dx[c] = (p->clouds[c].speed / 60.0f) * cosf(p->clouds[c].angle * (float)M_PI / 180.0f);
+        cloud_dy[c] = (p->clouds[c].speed / 60.0f) * sinf(p->clouds[c].angle * (float)M_PI / 180.0f);
+    }
+
     /* Prepare to measure runtime */
     r->runtime = get_time();
 
@@ -271,13 +279,10 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
         int block_size = 256;
         int grid_size = (total_cells + block_size - 1) / block_size;
 
-        /* Step 1.1: Clouds movement */
+        /* Step 1.1: Clouds movement — replaces per-iteration cos/sin with simple addition */
         for (int cloud = 0; cloud < p->num_clouds; cloud++) {
-            // Calculate new position (x are rows, y are columns)
-            Cloud_t *c_cloud = &p->clouds[cloud];
-            float km_minute = c_cloud->speed / 60;
-            c_cloud->x += km_minute * cos(c_cloud->angle * M_PI / 180.0);
-            c_cloud->y += km_minute * sin(c_cloud->angle * M_PI / 180.0);
+            p->clouds[cloud].x += cloud_dx[cloud];
+            p->clouds[cloud].y += cloud_dy[cloud];
         }
 
 #ifdef DEBUG
@@ -377,6 +382,8 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
 
     /* Free resources */
     free(water_level);
+    free(cloud_dx);
+    free(cloud_dy);
 
     unsigned long long total_water_loss_host = 0;
     CUDA_CHECK_FUNCTION(
