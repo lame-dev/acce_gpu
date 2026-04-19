@@ -327,7 +327,8 @@ extern "C" void do_compute(struct parameters *p, struct results *r) {
         /* Step 3: Propagation of previuosly computer water spillage to/from neighbors */
         max_spillage_iter = 0.0;
 
-        CUDA_CHECK_FUNCTION(cudaMemset(d_max_spillage_bits, 0, sizeof(int)));
+        /* Opt 2: Async memset — avoids host-device sync before propagation kernel */
+        CUDA_CHECK_FUNCTION(cudaMemsetAsync(d_max_spillage_bits, 0, sizeof(int), 0));
         step3_propagation_kernel<<<grid_size, block_size>>>(rows, columns, d_water_level, d_spillage_flag,
                                     d_spillage_level, d_spillage_from_neigh,
                                     d_max_spillage_bits);
